@@ -6,8 +6,5 @@ all: daemon client
 daemon: daemon.c
 	$(CC) $(CFLAGS) -o daemon daemon.c -lpthread
 
-client: client.c
-	$(CC) $(CFLAGS) -o client client.c
-
 clean:
-	rm -f daemon client db.socket
+	rm -f daemon

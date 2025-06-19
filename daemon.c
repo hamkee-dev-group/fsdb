@@ -23,9 +23,11 @@
 
 #define QUEUE_SIZE 1024
 #define MAX_EVENTS 64
-#define MAX_CMD 2048
-#define MAX_ID 255
+#define MAX_ID 256
 #define MAX_DATA 1024
+#define MAX_CMD (64 + MAX_ID + MAX_ID + MAX_DATA)
+#define MAX_PATH_LEN 768
+
 #define SOCKET_PATH "/tmp/fsdb.sock"
 #define DB_FOLDER "/var/lib/fsdb"
 #define LOG_FOLDER "/var/log"
@@ -77,7 +79,7 @@ int unlock_file(int fd)
 
 int write_file(const char *subdir, const char *id, const char *data, int update)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
 
     int flags = O_WRONLY | O_CREAT | (update ? O_TRUNC : O_EXCL);
@@ -107,7 +109,7 @@ int write_file(const char *subdir, const char *id, const char *data, int update)
 
 int read_file(const char *subdir, const char *id, char *out)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
 
     int fd = open(path, O_RDONLY);
@@ -136,13 +138,13 @@ int read_file(const char *subdir, const char *id, char *out)
 
 int delete_file(const char *subdir, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
     return unlink(path);
 }
 int touch_file(const char *subdir, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0)
@@ -154,7 +156,7 @@ int touch_file(const char *subdir, const char *id)
 
 int check_file(const char *subdir, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
     return access(path, F_OK);
 }
