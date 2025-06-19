@@ -1,10 +1,15 @@
-CC = clang
-CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -Wconversion -fsanitize=undefined -fsanitize=address -fstack-protector-strong -D_FORTIFY_SOURCE=2 -O2 -Wformat -Wshadow -Wcast-align	
+CC      := clang
+CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wpedantic -Wconversion \
+           -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+LDFLAGS := -Wl,-z,relro,-z,now -pie -lpthread
 
-all: daemon client
+all: daemon
 
-daemon: daemon.c
-	$(CC) $(CFLAGS) -o daemon daemon.c -lpthread
+daemon: daemon.o
+	$(CC) daemon.o $(LDFLAGS) -o $@
+
+daemon.o: daemon.c
+	$(CC) $(CFLAGS) -c daemon.c -o daemon.o
 
 clean:
-	rm -f daemon
+	rm -f daemon daemon.o
