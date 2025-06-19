@@ -140,6 +140,24 @@ int delete_file(const char *subdir, const char *id)
     snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
     return unlink(path);
 }
+int touch_file(const char *subdir, const char *id)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd < 0)
+        return -1;
+    fdatasync(fd);
+    close(fd);
+    return 0;
+}
+
+int check_file(const char *subdir, const char *id)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
+    return access(path, F_OK);
+}
 
 void audit_log(const char *cmd, const char *id, const char *status)
 {
@@ -360,6 +378,22 @@ void *worker_thread(void *arg)
                     }
                 }
             }
+        }
+        else if (strcmp(cmd, "TOUCH") == 0)
+        {
+            if (touch_file(db, id) == 0)
+                send(client_fd, "OK", 2, 0);
+            else if (errno == EEXIST)
+                send(client_fd, "ERR already exists", 19, 0);
+            else
+                send(client_fd, "ERR touch failed", 17, 0);
+        }
+        else if (strcmp(cmd, "EXISTS") == 0)
+        {
+            if (check_file(db, id) == 0)
+                send(client_fd, "Y", 1, 0);
+            else
+                send(client_fd, "N", 1, 0);
         }
         else if (strcmp(cmd, "UPDATE") == 0)
         {
