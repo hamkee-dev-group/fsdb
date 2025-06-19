@@ -31,7 +31,7 @@
 #define SOCKET_PATH "/tmp/fsdb.sock"
 #define DB_FOLDER "/var/lib/fsdb"
 #define LOG_FOLDER "/var/log"
-
+#define PIDFILE_PATH "/var/run/fsdb.pid"
 static int server_fd;
 static int epoll_fd;
 static int audit_fd;
@@ -54,11 +54,17 @@ void handle_signal(int sig)
 void cleanup_socket(void)
 {
     unlink(SOCKET_PATH);
-    close(server_fd);
-    close(epoll_fd);
-    close(audit_fd);
+    if (server_fd >= 0)
+        close(server_fd);
+    if (epoll_fd >= 0)
+        close(epoll_fd);
+    if (audit_fd >= 0)
+        close(audit_fd);
     if (pid_fd >= 0)
+    {
         close(pid_fd);
+        unlink(PIDFILE_PATH);
+    }
 }
 
 void log_sys(const char *msg)
@@ -76,11 +82,26 @@ int unlock_file(int fd)
     struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
     return fcntl(fd, F_SETLK, &fl);
 }
-
-int write_file(const char *subdir, const char *id, const char *data, int update)
+void build_data_path(char *path, size_t size, const char *db, const char *id)
 {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
+    char shard1 = id[0];
+    char shard2 = id[1] ? id[1] : '_';
+    snprintf(path, size, "%s/%s/%c/%c/%s", DB_FOLDER, db, shard1, shard2, id);
+}
+int write_file(const char *db, const char *id, const char *data, int update)
+{
+    char path[512];
+    build_data_path(path, sizeof(path), db, id);
+
+    if (!update)
+    {
+        struct stat st;
+        if (stat(path, &st) == 0)
+        {
+            errno = EEXIST;
+            return -1;
+        }
+    }
 
     int flags = O_WRONLY | O_CREAT | (update ? O_TRUNC : O_EXCL);
     int fd = open(path, flags, 0600);
@@ -92,6 +113,7 @@ int write_file(const char *subdir, const char *id, const char *data, int update)
         close(fd);
         return -1;
     }
+
     size_t len = strlen(data);
     ssize_t written = write(fd, data, len);
     if (written < 0 || (size_t)written < len)
@@ -100,18 +122,16 @@ int write_file(const char *subdir, const char *id, const char *data, int update)
         close(fd);
         return -1;
     }
-
     unlock_file(fd);
     fdatasync(fd);
     close(fd);
     return 0;
 }
 
-int read_file(const char *subdir, const char *id, char *out)
+int read_file(const char *db, const char *id, char *out)
 {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
-
+    char path[512];
+    build_data_path(path, sizeof(path), db, id);
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
@@ -129,36 +149,35 @@ int read_file(const char *subdir, const char *id, char *out)
         close(fd);
         return -1;
     }
-
     out[n] = '\0';
     unlock_file(fd);
     close(fd);
     return 0;
 }
 
-int delete_file(const char *subdir, const char *id)
+int delete_file(const char *db, const char *id)
 {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
+    char path[512];
+    build_data_path(path, sizeof(path), db, id);
     return unlink(path);
 }
-int touch_file(const char *subdir, const char *id)
+
+int check_file(const char *db, const char *id)
 {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
-    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
-    if (fd < 0)
-        return -1;
-    fdatasync(fd);
-    close(fd);
-    return 0;
+    char path[512];
+    build_data_path(path, sizeof(path), db, id);
+    return access(path, F_OK);
 }
 
-int check_file(const char *subdir, const char *id)
+int touch_file(const char *db, const char *id)
 {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/%s/%s", DB_FOLDER, subdir, id);
-    return access(path, F_OK);
+    char path[512];
+    build_data_path(path, sizeof(path), db, id);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0)
+        return -1;
+    close(fd);
+    return 0;
 }
 
 void audit_log(const char *cmd, const char *id, const char *status)
@@ -200,14 +219,18 @@ void audit_log(const char *cmd, const char *id, const char *status)
     fdatasync(audit_fd);
 }
 
-void sanitize_id(char *id)
+int sanitize_id(char *id)
 {
-    for (size_t i = 0; id[i]; ++i)
+    size_t i = 0;
+    for (; i < MAX_ID - 1 && id[i]; ++i)
     {
-        if (!(isalnum((unsigned char)id[i]) || id[i] == '_' || id[i] == '-'))
-            id[i] = '_';
+        if (!isalnum((unsigned char)id[i]))
+        {
+            return 0;
+        }
     }
-    id[MAX_ID - 1] = '\0';
+    id[i] = '\0';
+    return 1;
 }
 
 int enqueue_client(int fd)
@@ -295,6 +318,50 @@ int dequeue_client(void)
 
     return fd;
 }
+int generate_structure(const char *db)
+{
+    char base_path[512];
+    snprintf(base_path, sizeof(base_path), "%s/%s", DB_FOLDER, db);
+    mkdir(base_path, 0700);
+
+    for (char a = '0'; a <= 'z'; ++a)
+    {
+        if (!isalnum((unsigned char)a))
+            continue;
+
+        char level1[512];
+        snprintf(level1, sizeof(level1), "%s/%c", base_path, a);
+        struct stat st1;
+        if (stat(level1, &st1) == -1)
+        {
+            if (mkdir(level1, 0700) == -1 && errno != EEXIST)
+            {
+                log_sys("mkdir level1");
+                return 0;
+            }
+        }
+
+        for (char b = '0'; b <= 'z'; ++b)
+        {
+            if (!isalnum((unsigned char)b) && b != '_')
+                continue;
+
+            char level2[512];
+            snprintf(level2, sizeof(level2), "%s/%c", level1, b);
+            struct stat st2;
+            if (stat(level2, &st2) == -1)
+            {
+                if (mkdir(level2, 0700) == -1 && errno != EEXIST)
+                {
+                    log_sys("mkdir level2");
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 void *worker_thread(void *arg)
 {
     (void)arg;
@@ -327,7 +394,7 @@ void *worker_thread(void *arg)
         char *id = strtok_r(NULL, " ", &saveptr);
         const char *data = strtok_r(NULL, "", &saveptr);
 
-        if (!cmd || !db || !id)
+        if (!cmd || !db)
         {
             send(client_fd, "ERR invalid", 11, 0);
             shutdown(client_fd, SHUT_RDWR);
@@ -335,27 +402,27 @@ void *worker_thread(void *arg)
             continue;
         }
 
-        if (strstr(id, "..") || strstr(db, "..") || strchr(id, '/') || strchr(db, '/'))
+        if (strcmp(cmd, "CREATE") == 0)
+        {
+            if (!sanitize_id(db) || !generate_structure(db))
+            {
+                send(client_fd, "ERR CREATE", 10, 0);
+            }
+            else
+            {
+                send(client_fd, "OK", 2, 0);
+            }
+            close(client_fd);
+            continue;
+        }
+
+        if (!id || !sanitize_id(id))
         {
             send(client_fd, "ERR invalid ID", 14, 0);
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             continue;
         }
-
-        sanitize_id(db);
-        sanitize_id(id);
-
-        char db_path[512];
-        snprintf(db_path, sizeof(db_path), "%s/%s", DB_FOLDER, db);
-        if (mkdir(db_path, 0700) == -1 && errno != EEXIST)
-        {
-            send(client_fd, "ERR db access", 14, 0);
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            continue;
-        }
-
         if (strcmp(cmd, "INSERT") == 0)
         {
             if (!data)
@@ -479,6 +546,8 @@ void check_running(const char *pidfile_path)
     if (write(pid_fd, pid_str, strlen(pid_str)) < 0)
     {
         log_sys("write pidfile");
+        close(pid_fd);
+        unlink(pidfile_path);
         exit(EXIT_FAILURE);
     }
 }
@@ -494,11 +563,11 @@ int main(void)
     unlink(SOCKET_PATH);
 
     check_running("/var/run/fsdb.pid");
-
     server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd < 0)
     {
         log_sys("socket");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
@@ -510,12 +579,14 @@ int main(void)
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         log_sys("bind");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
     if (listen(server_fd, 128) < 0)
     {
         log_sys("listen");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
@@ -525,6 +596,7 @@ int main(void)
     if (audit_fd < 0)
     {
         log_sys("open audit log");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
@@ -532,6 +604,7 @@ int main(void)
     if (epoll_fd < 0)
     {
         log_sys("epoll_create1");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
@@ -539,6 +612,7 @@ int main(void)
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1)
     {
         log_sys("epoll_ctl ADD");
+        cleanup_socket();
         exit(EXIT_FAILURE);
     }
 
@@ -551,12 +625,14 @@ int main(void)
         if (pthread_create(&tid, NULL, worker_thread, NULL) != 0)
         {
             log_sys("pthread_create");
+            cleanup_socket();
             exit(EXIT_FAILURE);
         }
 
         if (pthread_detach(tid) != 0)
         {
             log_sys("pthread_detach");
+            cleanup_socket();
             exit(EXIT_FAILURE);
         }
     }

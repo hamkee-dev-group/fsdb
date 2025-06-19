@@ -1,4 +1,5 @@
 fsdb is a lightweight and secure Unix daemon that provides basic key-value storage functionality over a UNIX domain socket. 
+A local, atomic, multi-threaded, syslog-audited, filesystem-backed object store with consistent performance under load.
 It supports simple database-like operations (`INSERT`, `UPDATE`, `GET`, `DELETE`) backed by a directory-based flat file structure.
 
 - 🔒 Secure and concurrent: uses `epoll`, `pthread`, and safe file locking (`fcntl`)
