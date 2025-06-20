@@ -85,9 +85,14 @@ int unlock_file(int fd)
 
 void build_data_path(char *path, size_t size, const char *db, const char *id)
 {
-    char shard1 = id[0];
-    char shard2 = id[1] ? id[1] : '_';
-    snprintf(path, size, "%s/%s/%c/%c/%s", DB_FOLDER, db, shard1, shard2, id);
+    if (id[1])
+    {
+        snprintf(path, size, "%s/%s/%c/%c/%s", DB_FOLDER, db, id[0], id[1], id);
+    }
+    else
+    {
+        snprintf(path, size, "%s/%s/_/%s", DB_FOLDER, db, id);
+    }
 }
 
 int write_file(const char *db, const char *id, const char *data, int update)
@@ -325,7 +330,13 @@ int generate_structure(const char *db)
     char base_path[MAX_PATH_LEN];
     snprintf(base_path, sizeof(base_path), "%s/%s", DB_FOLDER, db);
     mkdir(base_path, 0700);
-
+    char special_path[MAX_PATH_LEN];
+    snprintf(special_path, sizeof(special_path), "%s/_", base_path);
+    if(mkdir(special_path, 0700) == -1 && errno != EEXIST)
+    {
+        log_sys("mkdir special path");
+        return 0;
+    }
     for (char a = '0'; a <= 'z'; ++a)
     {
         if (!isalnum((unsigned char)a))
@@ -345,7 +356,7 @@ int generate_structure(const char *db)
 
         for (char b = '0'; b <= 'z'; ++b)
         {
-            if (!isalnum((unsigned char)b) && b != '_')
+            if (!isalnum((unsigned char)b))
                 continue;
 
             char level2[MAX_PATH_LEN];
