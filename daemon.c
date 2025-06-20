@@ -26,7 +26,7 @@
 #define MAX_ID 256
 #define MAX_DATA 1024
 #define MAX_CMD (64 + MAX_ID + MAX_ID + MAX_DATA)
-#define MAX_PATH_LEN 768
+#define MAX_PATH_LEN 1024
 
 #define SOCKET_PATH "/tmp/fsdb.sock"
 #define DB_FOLDER "/var/lib/fsdb"
@@ -82,15 +82,17 @@ int unlock_file(int fd)
     struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
     return fcntl(fd, F_SETLK, &fl);
 }
+
 void build_data_path(char *path, size_t size, const char *db, const char *id)
 {
     char shard1 = id[0];
     char shard2 = id[1] ? id[1] : '_';
     snprintf(path, size, "%s/%s/%c/%c/%s", DB_FOLDER, db, shard1, shard2, id);
 }
+
 int write_file(const char *db, const char *id, const char *data, int update)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     build_data_path(path, sizeof(path), db, id);
 
     if (!update)
@@ -130,7 +132,7 @@ int write_file(const char *db, const char *id, const char *data, int update)
 
 int read_file(const char *db, const char *id, char *out)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     build_data_path(path, sizeof(path), db, id);
     int fd = open(path, O_RDONLY);
     if (fd < 0)
@@ -157,21 +159,21 @@ int read_file(const char *db, const char *id, char *out)
 
 int delete_file(const char *db, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     build_data_path(path, sizeof(path), db, id);
     return unlink(path);
 }
 
 int check_file(const char *db, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     build_data_path(path, sizeof(path), db, id);
     return access(path, F_OK);
 }
 
 int touch_file(const char *db, const char *id)
 {
-    char path[512];
+    char path[MAX_PATH_LEN];
     build_data_path(path, sizeof(path), db, id);
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
@@ -320,7 +322,7 @@ int dequeue_client(void)
 }
 int generate_structure(const char *db)
 {
-    char base_path[512];
+    char base_path[MAX_PATH_LEN];
     snprintf(base_path, sizeof(base_path), "%s/%s", DB_FOLDER, db);
     mkdir(base_path, 0700);
 
@@ -329,7 +331,7 @@ int generate_structure(const char *db)
         if (!isalnum((unsigned char)a))
             continue;
 
-        char level1[512];
+        char level1[MAX_PATH_LEN];
         snprintf(level1, sizeof(level1), "%s/%c", base_path, a);
         struct stat st1;
         if (stat(level1, &st1) == -1)
@@ -346,7 +348,7 @@ int generate_structure(const char *db)
             if (!isalnum((unsigned char)b) && b != '_')
                 continue;
 
-            char level2[512];
+            char level2[MAX_PATH_LEN];
             snprintf(level2, sizeof(level2), "%s/%c", level1, b);
             struct stat st2;
             if (stat(level2, &st2) == -1)
