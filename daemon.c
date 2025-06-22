@@ -66,6 +66,14 @@ void cleanup_socket(void)
         unlink(PIDFILE_PATH);
     }
 }
+ssize_t sosend(int fd, const void *buf, size_t len)
+{
+    ssize_t sent = send(fd, buf, len, MSG_NOSIGNAL);
+    if (sent < 0) {
+        syslog(LOG_WARNING, "send failed: %s", strerror(errno));
+    }
+    return sent;
+}
 
 void log_sys(const char *msg)
 {
@@ -332,7 +340,7 @@ int generate_structure(const char *db)
     mkdir(base_path, 0700);
     char special_path[MAX_PATH_LEN];
     snprintf(special_path, sizeof(special_path), "%s/_", base_path);
-    if(mkdir(special_path, 0700) == -1 && errno != EEXIST)
+    if (mkdir(special_path, 0700) == -1 && errno != EEXIST)
     {
         log_sys("mkdir special path");
         return 0;
@@ -400,6 +408,7 @@ void *worker_thread(void *arg)
             close(client_fd);
             continue;
         }
+        buf[len] = '\0';
 
         char *saveptr = NULL;
         const char *cmd = strtok_r(buf, " ", &saveptr);
@@ -409,7 +418,7 @@ void *worker_thread(void *arg)
 
         if (!cmd || !db)
         {
-            send(client_fd, "ERR invalid", 11, 0);
+            sosend(client_fd, "ERR invalid", 11);
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             continue;
@@ -419,11 +428,11 @@ void *worker_thread(void *arg)
         {
             if (!sanitize_id(db) || !generate_structure(db))
             {
-                send(client_fd, "ERR CREATE", 10, 0);
+                sosend(client_fd, "ERR CREATE", 10);
             }
             else
             {
-                send(client_fd, "OK", 2, 0);
+                sosend(client_fd, "OK", 2);
             }
             close(client_fd);
             continue;
@@ -431,7 +440,7 @@ void *worker_thread(void *arg)
 
         if (!id || !sanitize_id(id))
         {
-            send(client_fd, "ERR invalid ID", 14, 0);
+            sosend(client_fd, "ERR invalid ID", 14);
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             continue;
@@ -440,7 +449,7 @@ void *worker_thread(void *arg)
         {
             if (!data)
             {
-                send(client_fd, "ERR data missing", 17, 0);
+                sosend(client_fd, "ERR data missing", 17);
                 audit_log("INSERT", id, "ERROR_MISSING");
             }
             else
@@ -452,10 +461,10 @@ void *worker_thread(void *arg)
                 {
                     int err = errno;
                     if (err == EEXIST)
-                        send(client_fd, "ERR already exists", 19, 0);
+                        sosend(client_fd, "ERR already exists", 19);
                     else
                     {
-                        send(client_fd, "ERR write error", 16, 0);
+                        sosend(client_fd, "ERR write error", 16);
                         audit_log("INSERT", id, "ERROR_WRITE_FAIL");
                     }
                 }
@@ -464,32 +473,32 @@ void *worker_thread(void *arg)
         else if (strcmp(cmd, "TOUCH") == 0)
         {
             if (touch_file(db, id) == 0)
-                send(client_fd, "OK", 2, 0);
+                sosend(client_fd, "OK", 2);
             else if (errno == EEXIST)
-                send(client_fd, "ERR already exists", 19, 0);
+                sosend(client_fd, "ERR already exists", 19);
             else
-                send(client_fd, "ERR touch failed", 17, 0);
+                sosend(client_fd, "ERR touch failed", 17);
         }
         else if (strcmp(cmd, "EXISTS") == 0)
         {
             if (check_file(db, id) == 0)
-                send(client_fd, "Y", 1, 0);
+                sosend(client_fd, "Y", 1);
             else
-                send(client_fd, "N", 1, 0);
+                sosend(client_fd, "N", 1);
         }
         else if (strcmp(cmd, "UPDATE") == 0)
         {
             if (!data)
             {
-                send(client_fd, "ERR data missing", 16, 0);
+                sosend(client_fd, "ERR data missing", 16);
             }
             else if (write_file(db, id, data, 1) == 0)
             {
-                send(client_fd, "OK", 2, 0);
+                sosend(client_fd, "OK", 2);
             }
             else
             {
-                send(client_fd, "ERR update failed", 17, 0);
+                sosend(client_fd, "ERR update failed", 17);
                 audit_log("UPDATE", id, "ERROR_FAIL");
             }
         }
@@ -497,11 +506,11 @@ void *worker_thread(void *arg)
         {
             if (delete_file(db, id) == 0)
             {
-                send(client_fd, "OK", 2, 0);
+                sosend(client_fd, "OK", 2);
             }
             else
             {
-                send(client_fd, "ERR delete failed", 18, 0);
+                sosend(client_fd, "ERR delete failed", 18);
                 audit_log("DELETE", id, "ERROR_FAIL");
             }
         }
@@ -510,16 +519,16 @@ void *worker_thread(void *arg)
             char out[MAX_DATA + 1] = {0};
             if (read_file(db, id, out) == 0)
             {
-                send(client_fd, out, strlen(out), 0);
+                sosend(client_fd, out, strlen(out));
             }
             else
             {
-                send(client_fd, "ERR not found", 13, 0);
+                sosend(client_fd, "ERR not found", 13);
             }
         }
         else
         {
-            send(client_fd, "ERR unknown command", 20, 0);
+            sosend(client_fd, "ERR unknown command", 20);
             audit_log("UNKNOWN", id, "ERROR_CMD");
         }
 
@@ -568,7 +577,7 @@ void check_running(const char *pidfile_path)
 int main(void)
 {
     openlog("fsdb", LOG_PID | LOG_CONS, LOG_DAEMON);
-
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
