@@ -2,6 +2,7 @@ fsdb is a lightweight and secure Unix daemon that provides basic key-value stora
 A local, atomic, multi-threaded, syslog-audited, filesystem-backed object store with consistent performance under load.
 
 - ✅ Fast local IPC via UNIX domain sockets
+- ✅ HTTP/1.1 POST support: speak to `fsdb` from any language or frontend via HTTP, using nginx proxy or curl!
 - ✅ Extremely scalable 2-level folder sharding for 100M+ files
 - ✅ Safe concurrent access via POSIX file locks
 - ✅ Audit logging with timestamped entries
@@ -21,6 +22,12 @@ A local, atomic, multi-threaded, syslog-audited, filesystem-backed object store 
 - `DELETE <db> <id>`: remove entry
 - `CHECK <db> <id>`: test existence
 - `TOUCH <db> <id>`: create an empty file
+
+- **HTTP POST Parameters:**
+    - `ACTION` — one of `INSERT`, `UPDATE`, `GET`, `DELETE`, `EXISTS`, `TOUCH`, `CREATE`
+    - `db` — database name
+    - `id` — key
+    - `data` — value (if needed by action)
 
 🔐 Security & Hardening
 

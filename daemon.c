@@ -25,10 +25,10 @@
 #define MAX_EVENTS 64
 #define MAX_ID 256
 #define MAX_DATA 1024
-#define MAX_CMD (64 + MAX_ID + MAX_ID + MAX_DATA)
+#define MAX_CMD (256 + MAX_ID + MAX_ID + MAX_DATA)
 #define MAX_PATH_LEN 1024
 
-#define SOCKET_PATH "/tmp/fsdb.sock"
+#define SOCKET_PATH "/var/run/fsdb.sock"
 #define DB_FOLDER "/var/lib/fsdb"
 #define LOG_FOLDER "/var/log"
 #define PIDFILE_PATH "/var/run/fsdb.pid"
@@ -51,6 +51,118 @@ void handle_signal(int sig)
     pthread_cond_broadcast(&queue_cond);
 }
 
+void extract_value(const char *body, const char *key, char *dest, size_t maxlen)
+{
+    size_t keylen = strlen(key);
+    dest[0] = '\0';
+    while (*body)
+    {
+        const char *amp = strchr(body, '&');
+        const char *field_end = amp ? amp : body + strlen(body);
+
+        const char *eq = memchr(body, '=', field_end - body);
+        if (eq && (size_t)(eq - body) == keylen && memcmp(body, key, keylen) == 0)
+        {
+            size_t vlen = (size_t)(field_end - eq - 1);
+            if (vlen > maxlen - 1)
+                vlen = maxlen - 1;
+            memcpy(dest, eq + 1, vlen);
+            dest[vlen] = '\0';
+            return;
+        }
+        if (!amp)
+            break;
+        body = amp + 1;
+    }
+    dest[0] = '\0';
+}
+int url_decode_str(const char *src, char *dst, size_t dst_size)
+{
+    size_t di = 0;
+    for (size_t si = 0; src[si] && di + 1 < dst_size; ++si)
+    {
+        if (src[si] == '%')
+        {
+            if (isxdigit((unsigned char)src[si + 1]) && isxdigit((unsigned char)src[si + 2]))
+            {
+                char hex[3] = {src[si + 1], src[si + 2], 0};
+                char *endptr;
+                long val = strtol(hex, &endptr, 16);
+                if (endptr != hex + 2 || val < 0 || val > 255)
+                {
+                    dst[di] = '\0';
+                    return -1;
+                }
+                dst[di++] = (char)val;
+                si += 2;
+            }
+            else
+            {
+                dst[di] ='\0';
+                return -1;
+            }
+        }
+        else if (src[si] == '+')
+        {
+            dst[di++] = ' ';
+        }
+        else
+        {
+            dst[di++] = src[si];
+        }
+    }
+    dst[di] = '\0';
+    return 0;
+}
+
+int http_to_legacy_command(char *buf, size_t buflen)
+{
+    char action[32], db[256], id[256], data[1024];
+    char body[2048];
+
+    const char *p = strstr(buf, "\r\n\r\n");
+
+    if (!p)
+        return -1;
+    p += 4;
+    if (url_decode_str(p, body, 2048) == -1)
+        return -1;
+    extract_value(body, "ACTION", action, sizeof(action));
+    extract_value(body, "db", db, sizeof(db));
+    extract_value(body, "id", id, sizeof(id));
+    extract_value(body, "data", data, sizeof(data));
+
+    if (strcmp(action, "INSERT") == 0 && db[0] && id[0] && data[0])
+    {
+        snprintf(buf, buflen, "INSERT %s %s %s", db, id, data);
+    }
+    else if (strcmp(action, "GET") == 0 && db[0] && id[0])
+    {
+        snprintf(buf, buflen, "GET %s %s", db, id);
+    }
+    else if (strcmp(action, "TOUCH") == 0 && db[0] && id[0])
+    {
+        snprintf(buf, buflen, "TOUCH %s %s", db, id);
+    }
+    else if (strcmp(action, "UPDATE") == 0 && db[0] && id[0] && data[0])
+    {
+        snprintf(buf, buflen, "UPDATE %s %s %s", db, id, data);
+    }
+    else if (strcmp(action, "EXISTS") == 0 && db[0] && id[0])
+    {
+        snprintf(buf, buflen, "EXISTS %s %s", db, id);
+    }
+    else if (strcmp(action, "CREATE") == 0 && db[0])
+    {
+        snprintf(buf, buflen, "CREATE %s", db);
+    }
+    else
+    {
+        return -1;
+    }
+    return 0;
+}
+
 void cleanup_socket(void)
 {
     unlink(SOCKET_PATH);
@@ -66,10 +178,22 @@ void cleanup_socket(void)
         unlink(PIDFILE_PATH);
     }
 }
-ssize_t sosend(int fd, const void *buf, size_t len)
+ssize_t sosend(int fd, const void *buf, size_t len, int post_request)
 {
-    ssize_t sent = send(fd, buf, len, MSG_NOSIGNAL);
-    if (sent < 0) {
+    ssize_t sent = 0;
+    if (post_request)
+    {
+        char response[2048];
+        snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s", len, (char *)buf);
+        sent = send(fd, response, strlen(response), MSG_NOSIGNAL);
+    }
+    else
+    {
+        sent = send(fd, buf, len, MSG_NOSIGNAL);
+    }
+
+    if (sent < 0)
+    {
         syslog(LOG_WARNING, "send failed: %s", strerror(errno));
     }
     return sent;
@@ -409,7 +533,19 @@ void *worker_thread(void *arg)
             continue;
         }
         buf[len] = '\0';
-
+        int post_request = 0;
+        if (strncmp(buf, "POST ", 5) == 0)
+        {
+            post_request = 1;
+            if (http_to_legacy_command(buf, sizeof(buf)) == -1)
+            {
+                sosend(client_fd, "ERR invalid", 11, post_request);
+                shutdown(client_fd, SHUT_RDWR);
+                close(client_fd);
+                continue;
+            }
+            // buf is now rewritten to the normal command format, e.g. "INSERT testdb mykey hello"
+        }
         char *saveptr = NULL;
         const char *cmd = strtok_r(buf, " ", &saveptr);
         char *db = strtok_r(NULL, " ", &saveptr);
@@ -418,7 +554,7 @@ void *worker_thread(void *arg)
 
         if (!cmd || !db)
         {
-            sosend(client_fd, "ERR invalid", 11);
+            sosend(client_fd, "ERR invalid", 11, post_request);
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             continue;
@@ -428,11 +564,11 @@ void *worker_thread(void *arg)
         {
             if (!sanitize_id(db) || !generate_structure(db))
             {
-                sosend(client_fd, "ERR CREATE", 10);
+                sosend(client_fd, "ERR CREATE", 10, post_request);
             }
             else
             {
-                sosend(client_fd, "OK", 2);
+                sosend(client_fd, "OK", 2, post_request);
             }
             close(client_fd);
             continue;
@@ -440,7 +576,7 @@ void *worker_thread(void *arg)
 
         if (!id || !sanitize_id(id))
         {
-            sosend(client_fd, "ERR invalid ID", 14);
+            sosend(client_fd, "ERR invalid ID", 14, post_request);
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             continue;
@@ -449,22 +585,22 @@ void *worker_thread(void *arg)
         {
             if (!data)
             {
-                sosend(client_fd, "ERR data missing", 17);
+                sosend(client_fd, "ERR data missing", 16, post_request);
                 audit_log("INSERT", id, "ERROR_MISSING");
             }
             else
             {
                 int res = write_file(db, id, data, 0);
                 if (res == 0)
-                    send(client_fd, "OK", 2, 0);
+                    sosend(client_fd, "OK", 2, post_request);
                 else
                 {
                     int err = errno;
                     if (err == EEXIST)
-                        sosend(client_fd, "ERR already exists", 19);
+                        sosend(client_fd, "ERR already exists", 18, post_request);
                     else
                     {
-                        sosend(client_fd, "ERR write error", 16);
+                        sosend(client_fd, "ERR write error", 15, post_request);
                         audit_log("INSERT", id, "ERROR_WRITE_FAIL");
                     }
                 }
@@ -473,32 +609,32 @@ void *worker_thread(void *arg)
         else if (strcmp(cmd, "TOUCH") == 0)
         {
             if (touch_file(db, id) == 0)
-                sosend(client_fd, "OK", 2);
+                sosend(client_fd, "OK", 2, post_request);
             else if (errno == EEXIST)
-                sosend(client_fd, "ERR already exists", 19);
+                sosend(client_fd, "ERR already exists", 18, post_request);
             else
-                sosend(client_fd, "ERR touch failed", 17);
+                sosend(client_fd, "ERR touch failed", 16, post_request);
         }
         else if (strcmp(cmd, "EXISTS") == 0)
         {
             if (check_file(db, id) == 0)
-                sosend(client_fd, "Y", 1);
+                sosend(client_fd, "Y", 1, post_request);
             else
-                sosend(client_fd, "N", 1);
+                sosend(client_fd, "N", 1, post_request);
         }
         else if (strcmp(cmd, "UPDATE") == 0)
         {
             if (!data)
             {
-                sosend(client_fd, "ERR data missing", 16);
+                sosend(client_fd, "ERR data missing", 16, post_request);
             }
             else if (write_file(db, id, data, 1) == 0)
             {
-                sosend(client_fd, "OK", 2);
+                sosend(client_fd, "OK", 2, post_request);
             }
             else
             {
-                sosend(client_fd, "ERR update failed", 17);
+                sosend(client_fd, "ERR update failed", 17, post_request);
                 audit_log("UPDATE", id, "ERROR_FAIL");
             }
         }
@@ -506,11 +642,11 @@ void *worker_thread(void *arg)
         {
             if (delete_file(db, id) == 0)
             {
-                sosend(client_fd, "OK", 2);
+                sosend(client_fd, "OK", 2, post_request);
             }
             else
             {
-                sosend(client_fd, "ERR delete failed", 18);
+                sosend(client_fd, "ERR delete failed", 17, post_request);
                 audit_log("DELETE", id, "ERROR_FAIL");
             }
         }
@@ -519,16 +655,16 @@ void *worker_thread(void *arg)
             char out[MAX_DATA + 1] = {0};
             if (read_file(db, id, out) == 0)
             {
-                sosend(client_fd, out, strlen(out));
+                sosend(client_fd, out, strlen(out), post_request);
             }
             else
             {
-                sosend(client_fd, "ERR not found", 13);
+                sosend(client_fd, "ERR not found", 13, post_request);
             }
         }
         else
         {
-            sosend(client_fd, "ERR unknown command", 20);
+            sosend(client_fd, "ERR unknown command", 19, post_request);
             audit_log("UNKNOWN", id, "ERROR_CMD");
         }
 
@@ -604,7 +740,12 @@ int main(void)
         cleanup_socket();
         exit(EXIT_FAILURE);
     }
-
+    int res = chmod(SOCKET_PATH, 0666); // rw for everyone
+    if (res != 0)
+    {
+        perror("chmod failed");
+        return 1;
+    }
     if (listen(server_fd, 128) < 0)
     {
         log_sys("listen");
