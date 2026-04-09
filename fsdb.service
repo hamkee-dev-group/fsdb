@@ -1,0 +1,27 @@
+[Unit]
+Description=fsdb — filesystem-backed key-value store
+After=local-fs.target
+Documentation=https://github.com/hamkee/fsdb
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fsdb
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+User=fsdb
+Group=fsdb
+LimitNOFILE=65536
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fsdb /var/run /var/log
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
