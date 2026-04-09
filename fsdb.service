@@ -14,8 +14,17 @@ User=fsdb
 Group=fsdb
 LimitNOFILE=65536
 
+RuntimeDirectory=fsdb
+StateDirectory=fsdb
+LogsDirectory=fsdb
+
+Environment=FSDB_SOCKET=/run/fsdb/fsdb.sock
+Environment=FSDB_DBDIR=/var/lib/fsdb
+Environment=FSDB_LOGDIR=/var/log/fsdb
+Environment=FSDB_PIDFILE=/run/fsdb/fsdb.pid
+
 ProtectSystem=strict
-ReadWritePaths=/var/lib/fsdb /var/run /var/log
+ReadWritePaths=/run/fsdb /var/lib/fsdb /var/log/fsdb
 ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true

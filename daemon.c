@@ -23,7 +23,7 @@
 #include <stdatomic.h>
 #include <limits.h>
 
- 
+/* ── Limits ── */
 #define QUEUE_SIZE      1024
 #define MAX_EVENTS      64
 #define MAX_ID          256
@@ -35,7 +35,7 @@
 #define MAX_WORKERS     256
 #define MAX_KEYS_BUF    (64 * 1024)
 
- 
+/* ── Default paths (overridable via environment) ── */
 #define DEFAULT_SOCKET_PATH  "/var/run/fsdb.sock"
 #define DEFAULT_DB_FOLDER    "/var/lib/fsdb"
 #define DEFAULT_LOG_FOLDER   "/var/log"
@@ -48,52 +48,49 @@ static const char *log_folder;
 static const char *pidfile_path;
 static const char *auth_token_path;
 
- 
+/* ── Global state: file descriptors ── */
 static int server_fd = -1;
 static int epoll_fd  = -1;
 static int audit_fd  = -1;
 static int pid_fd    = -1;
 
- 
+/* ── Self-pipe for async-signal-safe signal delivery ── */
 static int signal_pipe[2] = {-1, -1};
 
- 
+/* ── Worker thread pool and client queue ── */
 static int client_queue[QUEUE_SIZE];
 static int queue_head = 0, queue_tail = 0;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  queue_cond = PTHREAD_COND_INITIALIZER;
 
- 
+/* ── Worker thread handles ── */
 static pthread_t worker_tids[MAX_WORKERS];
 static int       worker_count = 0;
 
- 
+/* ── Statistics counters ── */
 static time_t               start_time;
 static atomic_uint_fast64_t stat_total_requests;
 static atomic_uint_fast64_t stat_active_workers;
 
- 
+/* ── HTTP bearer-token authentication ── */
 static char auth_token[256];
 static int  auth_enabled = 0;
 
- 
+/* ── Audit log serialization ── */
 static pthread_mutex_t audit_lock = PTHREAD_MUTEX_INITIALIZER;
 
- 
-static size_t max_data_size = 1024;     
-static int    rate_limit    = 0;        
-static long   default_ttl   = 0;       
-static mode_t socket_mode   = 0660;    
+/* ── Configurable limits ── */
+static size_t max_data_size = 1024;
+static int    rate_limit    = 0;
+static long   default_ttl   = 0;
+static mode_t socket_mode   = 0660;
 
- 
+/* ── Rate limiter state (main thread only) ── */
 static int    rate_count;
 static time_t rate_window;
 
 static _Atomic int running = 1;
-
-
-
-
+ 
 static void handle_signal(int sig)
 {
     int saved = errno;
@@ -123,6 +120,11 @@ static void log_sys(const char *msg)
 
 
 
+static int url_decode_str(const char *src, char *dst, size_t dst_size);
+
+
+
+
 static void extract_value(const char *body, const char *key, char *dest, size_t maxlen)
 {
     size_t keylen = strlen(key);
@@ -134,11 +136,19 @@ static void extract_value(const char *body, const char *key, char *dest, size_t 
         const char *eq = memchr(body, '=', (size_t)(field_end - body));
         if (eq && (size_t)(eq - body) == keylen && memcmp(body, key, keylen) == 0)
         {
-            size_t vlen = (size_t)(field_end - eq - 1);
-            if (vlen > maxlen - 1)
-                vlen = maxlen - 1;
-            memcpy(dest, eq + 1, vlen);
-            dest[vlen] = '\0';
+             
+            size_t raw_len = (size_t)(field_end - eq - 1);
+            char *raw = malloc(raw_len + 1);
+            if (!raw)
+            {
+                dest[0] = '\0';
+                return;
+            }
+            memcpy(raw, eq + 1, raw_len);
+            raw[raw_len] = '\0';
+            if (url_decode_str(raw, dest, maxlen) == -1)
+                dest[0] = '\0';
+            free(raw);
             return;
         }
         if (!amp)
@@ -182,28 +192,29 @@ static int http_to_legacy_command(char *buf, size_t buflen)
 {
     char action[32], db[256], id[256];
     char *data = malloc(MAX_DATA_HARD);
-    char *body = malloc(MAX_DATA_HARD + 1024);
-    if (!data || !body)
-    {
-        free(data);
-        free(body);
+    if (!data)
         return -1;
-    }
 
     int rc = -1;
-    size_t body_size = (size_t)MAX_DATA_HARD + 1024;
 
     const char *p = strstr(buf, "\r\n\r\n");
     if (!p)
         goto out;
     p += 4;
-    if (url_decode_str(p, body, body_size) == -1)
-        goto out;
+    
 
-    extract_value(body, "ACTION", action, sizeof(action));
-    extract_value(body, "db", db, sizeof(db));
-    extract_value(body, "id", id, sizeof(id));
-    extract_value(body, "data", data, (size_t)MAX_DATA_HARD);
+    extract_value(p, "ACTION", action, sizeof(action));
+    extract_value(p, "db", db, sizeof(db));
+    extract_value(p, "id", id, sizeof(id));
+    extract_value(p, "data", data, (size_t)MAX_DATA_HARD);
+
+    
+
+
+    if (db[0] && strlen(db) >= sizeof(db) - 1)
+        goto out;
+    if (id[0] && strlen(id) >= sizeof(id) - 1)
+        goto out;
 
     if (strcmp(action, "INSERT") == 0 && db[0] && id[0] && data[0])
         snprintf(buf, buflen, "INSERT %s %s %s", db, id, data);
@@ -230,7 +241,6 @@ static int http_to_legacy_command(char *buf, size_t buflen)
     rc = 0;
 out:
     free(data);
-    free(body);
     return rc;
 }
 
@@ -334,25 +344,48 @@ static ssize_t send_all(int fd, const void *buf, size_t len, int flags)
     return (ssize_t)len;
 }
 
-static ssize_t sosend(int fd, const void *buf, size_t len, int post_request)
+static const char *http_status_line(int code)
+{
+    switch (code)
+    {
+    case 200: return "200 OK";
+    case 400: return "400 Bad Request";
+    case 404: return "404 Not Found";
+    case 409: return "409 Conflict";
+    case 413: return "413 Payload Too Large";
+    case 429: return "429 Too Many Requests";
+    case 500: return "500 Internal Server Error";
+    case 503: return "503 Service Unavailable";
+    default:  return "500 Internal Server Error";
+    }
+}
+
+/* Send response with explicit HTTP status code when post_request is true.
+   For native protocol (post_request == 0), status_code is ignored. */
+static ssize_t sosend_status(int fd, const void *buf, size_t len,
+                             int post_request, int status_code)
 {
     ssize_t sent;
     if (post_request)
     {
-        char response[MAX_DATA_HARD + 512];
-        int n = snprintf(response, sizeof(response),
-                         "HTTP/1.1 200 OK\r\n"
+        size_t resp_size = len + 512;
+        char *response = malloc(resp_size);
+        if (!response)
+            return -1;
+        int n = snprintf(response, resp_size,
+                         "HTTP/1.1 %s\r\n"
                          "Content-Type: text/plain\r\n"
                          "Content-Length: %zu\r\n"
                          "Connection: close\r\n\r\n",
-                         len);
-        if (n > 0 && (size_t)n < sizeof(response) - len)
+                         http_status_line(status_code), len);
+        if (n > 0 && (size_t)n < resp_size - len)
         {
             memcpy(response + n, buf, len);
             sent = send_all(fd, response, (size_t)n + len, MSG_NOSIGNAL);
         }
         else
             sent = -1;
+        free(response);
     }
     else
         sent = send_all(fd, buf, len, MSG_NOSIGNAL);
@@ -362,13 +395,20 @@ static ssize_t sosend(int fd, const void *buf, size_t len, int post_request)
     return sent;
 }
 
+/* Convenience: send a 200 OK response */
+static ssize_t sosend(int fd, const void *buf, size_t len, int post_request)
+{
+    return sosend_status(fd, buf, len, post_request, 200);
+}
+
 
 
 
 static ssize_t recv_full(int fd, char *buf, size_t bufsize, int timeout_ms)
 {
     size_t total = 0;
-    int proto = -1;  
+    int proto = -1;
+    int frame_complete = 0;
 
     while (total < bufsize - 1)
     {
@@ -376,13 +416,20 @@ static ssize_t recv_full(int fd, char *buf, size_t bufsize, int timeout_ms)
         if (total == 0)
             wait_ms = timeout_ms;
         else if (proto == 1)
-            wait_ms = 200;
+            wait_ms = 2000; /* HTTP: allow slow bodies up to 2s between chunks */
         else
-            wait_ms = 50;  
+            wait_ms = 1000; /* native: 1s for fragmented line to complete */
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        if (poll(&pfd, 1, wait_ms) <= 0)
+        int pret = poll(&pfd, 1, wait_ms);
+        if (pret < 0)
+        {
+            if (errno == EINTR)
+                continue;
             break;
+        }
+        if (pret == 0)
+            break; /* timeout — frame_complete stays 0 */
 
         ssize_t n = recv(fd, buf + total, bufsize - 1 - total, 0);
         if (n <= 0)
@@ -394,8 +441,11 @@ static ssize_t recv_full(int fd, char *buf, size_t bufsize, int timeout_ms)
         {
             if (total >= 5 && strncmp(buf, "POST ", 5) == 0)
                 proto = 1;
-            else if (total >= 4 && strncmp(buf, "GET ", 4) == 0)
+            else if (total >= 14 && strncmp(buf, "GET /", 5) == 0 &&
+                     strstr(buf, " HTTP/") != NULL)
                 proto = 1;
+            else if (total >= 4 && strncmp(buf, "GET ", 4) == 0)
+                proto = 0;
             else
                 proto = 0;
         }
@@ -413,33 +463,55 @@ static ssize_t recv_full(int fd, char *buf, size_t bufsize, int timeout_ms)
                     {
                         char *endp;
                         long clen = strtol(cl + 17, &endp, 10);
-                         
                         if (clen < 0 || clen > (long)(bufsize - hdr_len))
+                        {
+                            frame_complete = 1; /* reject: malformed/too large */
                             break;
-                        if (endp == cl + 17)  
+                        }
+                        if (endp == cl + 17)
+                        {
+                            frame_complete = 1;
                             break;
+                        }
                         if (hdr_len + (size_t)clen <= total)
-                            break;  
+                        {
+                            frame_complete = 1;
+                            break; /* full body received */
+                        }
                     }
                     else
-                        break;  
+                    {
+                        frame_complete = 1; /* no Content-Length, treat headers-only as complete */
+                        break;
+                    }
                 }
             }
-            else  
+            else /* HTTP GET */
             {
                 if (strstr(buf, "\r\n\r\n"))
+                {
+                    frame_complete = 1;
                     break;
+                }
             }
         }
-        else
+        else /* native protocol */
         {
-             
             if (memchr(buf, '\n', total))
+            {
+                frame_complete = 1;
                 break;
+            }
         }
     }
 
-     
+    /* Reject incomplete frames: if we received data but never saw a complete
+       message boundary (newline for native, headers+body for HTTP), treat
+       the request as malformed rather than processing truncated input. */
+    if (total > 0 && !frame_complete)
+        return -1;
+
+    /* Strip trailing newline/CR for native protocol */
     if (total > 0 && proto != 1 && buf[total - 1] == '\n')
         buf[--total] = '\0';
     if (total > 0 && proto != 1 && buf[total - 1] == '\r')
@@ -483,7 +555,29 @@ static void ensure_parent_dir(const char *db, const char *id)
     }
 }
 
-static int is_expired(const char *path)  
+/* fsync the parent directory to ensure metadata changes (link/rename/unlink)
+   are durable. Best-effort: returns -1 on failure but callers may ignore. */
+static int fsync_parent_dir(const char *path)
+{
+    char dir[MAX_PATH_LEN];
+    size_t len = strlen(path);
+    if (len >= sizeof(dir))
+        return -1;
+    memcpy(dir, path, len + 1);
+    /* Walk backwards to find last '/' */
+    char *slash = strrchr(dir, '/');
+    if (!slash)
+        return -1;
+    *slash = '\0';
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return -1;
+    int rc = fsync(dfd);
+    close(dfd);
+    return rc;
+}
+
+static int is_expired(const char *path)
 {
     if (default_ttl <= 0)
         return 0;
@@ -529,17 +623,36 @@ static int write_file(const char *db, const char *id, const char *data, int upda
         }
         total_written += (size_t)w;
     }
-    fdatasync(fd);
-    close(fd);
+    if (fdatasync(fd) != 0)
+    {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (close(fd) != 0)
+    {
+        /* close failure after fdatasync means data may not be on disk */
+        unlink(tmp_path);
+        return -1;
+    }
+
+    /* TTL: treat expired keys as non-existent for UPDATE (returns error)
+       and as free slots for INSERT (allows reuse without explicit DELETE). */
+    if (is_expired(path))
+        unlink(path);
 
     if (update)
     {
-         
-        if (access(path, F_OK) != 0)
+        /* Note: TOCTOU between lstat() and rename() — a concurrent DELETE
+           could remove the key after this check. The filesystem offers no
+           atomic "rename-only-if-target-exists". Acceptable for a file-backed
+           KV store; concurrent UPDATE+DELETE on the same key is inherently racy. */
+        struct stat st;
+        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
         {
             int saved = errno;
             unlink(tmp_path);
-            errno = saved;
+            errno = saved ? saved : ENOENT;
             return -1;
         }
         if (rename(tmp_path, path) != 0)
@@ -559,6 +672,7 @@ static int write_file(const char *db, const char *id, const char *data, int upda
         }
         unlink(tmp_path);
     }
+    fsync_parent_dir(path);
     return 0;
 }
 
@@ -579,11 +693,52 @@ static int read_file(const char *db, const char *id, char *out, size_t out_size)
     if (fd < 0)
         return -1;
 
-    ssize_t n = read(fd, out, out_size - 1);
-    close(fd);
-    if (n < 0)
+    /* Verify file size fits in buffer before reading */
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+    {
+        close(fd);
         return -1;
-    out[n] = '\0';
+    }
+    if (!S_ISREG(st.st_mode))
+    {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    if (st.st_size >= (off_t)out_size)
+    {
+        close(fd);
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    /* Read loop: keep reading until EOF or buffer full */
+    size_t total = 0;
+    while (total < out_size - 1)
+    {
+        ssize_t n = read(fd, out + total, out_size - 1 - total);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (n == 0)
+            break; /* EOF */
+        total += (size_t)n;
+    }
+    close(fd);
+
+    /* Verify we read the expected amount (detect concurrent truncation) */
+    if ((off_t)total != st.st_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+
+    out[total] = '\0';
     return 0;
 }
 
@@ -592,7 +747,10 @@ static int delete_file(const char *db, const char *id)
     char path[MAX_PATH_LEN];
     if (build_data_path(path, sizeof(path), db, id) != 0)
         return -1;
-    return unlink(path);
+    if (unlink(path) != 0)
+        return -1;
+    fsync_parent_dir(path);
+    return 0;
 }
 
 static int check_file(const char *db, const char *id)
@@ -613,35 +771,47 @@ static int touch_file(const char *db, const char *id)
     char path[MAX_PATH_LEN];
     if (build_data_path(path, sizeof(path), db, id) != 0)
         return -1;
+     
+    if (is_expired(path))
+        unlink(path);
     ensure_parent_dir(db, id);
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0)
         return -1;
-    close(fd);
+    if (close(fd) != 0)
+    {
+        unlink(path);
+        return -1;
+    }
+    fsync_parent_dir(path);
     return 0;
 }
 
 
 
 
+/* Reserve bytes at end of KEYS buffer for "+TRUNCATED\n" indicator */
+#define KEYS_TRUNCATED_RESERVE 16
+
 static void handle_keys(int fd, const char *db, int limit, int post_request)
 {
     char *out = malloc(MAX_KEYS_BUF);
     if (!out)
     {
-        sosend(fd, "ERR out of memory", 17, post_request);
+        sosend_status(fd, "ERR out of memory", 17, post_request, 500);
         return;
     }
 
     size_t pos = 0;
     int count = 0;
+    int truncated = 0;
     char base[MAX_PATH_LEN];
     snprintf(base, sizeof(base), "%s/%s", db_folder, db);
 
     DIR *d1 = opendir(base);
     if (!d1)
     {
-        sosend(fd, "ERR database not found", 22, post_request);
+        sosend_status(fd, "ERR database not found", 22, post_request, 404);
         free(out);
         return;
     }
@@ -665,6 +835,8 @@ static void handle_keys(int fd, const char *db, int limit, int post_request)
             {
                 if (es->d_name[0] == '.')
                     continue;
+                if (strchr(es->d_name, '.'))
+                    continue; /* temp-file artifact (e.g. a.XXXXXX from crash) */
                 if (default_ttl > 0)
                 {
                     char fp[MAX_PATH_LEN];
@@ -676,8 +848,9 @@ static void handle_keys(int fd, const char *db, int limit, int post_request)
                     }
                 }
                 int n = snprintf(out + pos, MAX_KEYS_BUF - pos, "%s\n", es->d_name);
-                if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF)
+                if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF - KEYS_TRUNCATED_RESERVE)
                 {
+                    truncated = 1;
                     closedir(ds);
                     goto keys_done;
                 }
@@ -719,8 +892,9 @@ static void handle_keys(int fd, const char *db, int limit, int post_request)
                         }
                     }
                     int n = snprintf(out + pos, MAX_KEYS_BUF - pos, "%s\n", e3->d_name);
-                    if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF)
+                    if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF - KEYS_TRUNCATED_RESERVE)
                     {
+                        truncated = 1;
                         closedir(d3);
                         closedir(d2);
                         goto keys_done;
@@ -737,9 +911,18 @@ keys_done:
     closedir(d1);
 
     if (pos == 0)
+    {
         sosend(fd, "EMPTY", 5, post_request);
+    }
     else
     {
+        if (truncated)
+        {
+            /* Append truncation indicator so clients know the list is incomplete */
+            int tn = snprintf(out + pos, MAX_KEYS_BUF - pos, "+TRUNCATED\n");
+            if (tn > 0 && pos + (size_t)tn < MAX_KEYS_BUF)
+                pos += (size_t)tn;
+        }
         if (pos > 0 && out[pos - 1] == '\n')
             pos--;
         sosend(fd, out, pos, post_request);
@@ -755,7 +938,7 @@ static void handle_count(int fd, const char *db, int post_request)
     DIR *d1 = opendir(base);
     if (!d1)
     {
-        sosend(fd, "ERR database not found", 22, post_request);
+        sosend_status(fd, "ERR database not found", 22, post_request, 404);
         return;
     }
 
@@ -778,6 +961,8 @@ static void handle_count(int fd, const char *db, int post_request)
             {
                 if (es->d_name[0] == '.')
                     continue;
+                if (strchr(es->d_name, '.'))
+                    continue; /* temp-file artifact */
                 if (default_ttl > 0)
                 {
                     char fp[MAX_PATH_LEN];
@@ -868,7 +1053,8 @@ static void audit_log(const char *cmd, const char *id, const char *status)
         total_written += (size_t)w;
     }
 
-    fdatasync(audit_fd);  
+    if (fdatasync(audit_fd) != 0)
+        log_sys("audit_log: fdatasync");
 
     pthread_mutex_unlock(&audit_lock);
 }
@@ -1047,11 +1233,12 @@ static void *worker_thread(void *arg)
         int post_request = 0;
 
          
-        if (len >= 4 && strncmp(buf, "GET ", 4) == 0)
+        
+
+        if (len >= 14 && strncmp(buf, "GET /", 5) == 0 && strstr(buf, " HTTP/") != NULL)
         {
-             
             const char *path_start = buf + 4;
-            const char *path_end = strchr(path_start, ' ');
+            const char *path_end = strstr(path_start, " HTTP/");
             size_t plen = path_end ? (size_t)(path_end - path_start) : strlen(path_start);
             if ((plen == 7 && memcmp(path_start, "/health", 7) == 0) ||
                 (plen == 6 && memcmp(path_start, "/stats", 6) == 0))
@@ -1065,6 +1252,7 @@ static void *worker_thread(void *arg)
             }
             goto done;
         }
+         
 
          
         if (len >= 5 && strncmp(buf, "POST ", 5) == 0)
@@ -1080,26 +1268,23 @@ static void *worker_thread(void *arg)
             }
             if (http_to_legacy_command(buf, sizeof(buf)) == -1)
             {
-                sosend(client_fd, "ERR invalid", 11, post_request);
+                sosend_status(client_fd, "ERR invalid", 11, post_request, 400);
                 goto done;
             }
         }
 
-         
         char *saveptr = NULL;
         const char *cmd = strtok_r(buf, " ", &saveptr);
         char *db = strtok_r(NULL, " ", &saveptr);
         char *id = strtok_r(NULL, " ", &saveptr);
-         
         const char *data = (saveptr && *saveptr) ? saveptr : NULL;
 
         if (!cmd)
         {
-            sosend(client_fd, "ERR invalid", 11, post_request);
+            sosend_status(client_fd, "ERR invalid", 11, post_request, 400);
             goto done;
         }
 
-         
         if (strcmp(cmd, "STATS") == 0)
         {
             handle_stats(client_fd, post_request);
@@ -1108,21 +1293,20 @@ static void *worker_thread(void *arg)
 
         if (!db)
         {
-            sosend(client_fd, "ERR invalid", 11, post_request);
+            sosend_status(client_fd, "ERR invalid", 11, post_request, 400);
             goto done;
         }
 
         if (!sanitize_id(db))
         {
-            sosend(client_fd, "ERR invalid DB", 14, post_request);
+            sosend_status(client_fd, "ERR invalid DB", 14, post_request, 400);
             goto done;
         }
 
-         
         if (strcmp(cmd, "CREATE") == 0)
         {
             if (!generate_structure(db))
-                sosend(client_fd, "ERR CREATE", 10, post_request);
+                sosend_status(client_fd, "ERR CREATE", 10, post_request, 500);
             else
                 sosend(client_fd, "OK", 2, post_request);
             goto done;
@@ -1134,9 +1318,11 @@ static void *worker_thread(void *arg)
             int limit = 1000;
             if (id)
             {
-                limit = atoi(id);
-                if (limit <= 0 || limit > 100000)
-                    limit = 1000;
+                char *endp;
+                long lv = strtol(id, &endp, 10);
+                if (*endp != '\0' || lv <= 0 || lv > 100000)
+                    lv = 1000;
+                limit = (int)lv;
             }
             handle_keys(client_fd, db, limit, post_request);
             goto done;
@@ -1151,21 +1337,20 @@ static void *worker_thread(void *arg)
 
         if (!id || !sanitize_id(id))
         {
-            sosend(client_fd, "ERR invalid ID", 14, post_request);
+            sosend_status(client_fd, "ERR invalid ID", 14, post_request, 400);
             goto done;
         }
 
-         
         if (strcmp(cmd, "INSERT") == 0)
         {
             if (!data)
             {
-                sosend(client_fd, "ERR data missing", 16, post_request);
+                sosend_status(client_fd, "ERR data missing", 16, post_request, 400);
                 audit_log("INSERT", id, "ERROR_MISSING");
             }
-            else if (strlen(data) > max_data_size)  
+            else if (strlen(data) > max_data_size)
             {
-                sosend(client_fd, "ERR data too large", 18, post_request);
+                sosend_status(client_fd, "ERR data too large", 18, post_request, 413);
                 audit_log("INSERT", id, "ERROR_TOO_LARGE");
             }
             else
@@ -1174,10 +1359,10 @@ static void *worker_thread(void *arg)
                 if (res == 0)
                     sosend(client_fd, "OK", 2, post_request);
                 else if (errno == EEXIST)
-                    sosend(client_fd, "ERR already exists", 18, post_request);
+                    sosend_status(client_fd, "ERR already exists", 18, post_request, 409);
                 else
                 {
-                    sosend(client_fd, "ERR write error", 15, post_request);
+                    sosend_status(client_fd, "ERR write error", 15, post_request, 500);
                     audit_log("INSERT", id, "ERROR_WRITE_FAIL");
                 }
             }
@@ -1187,9 +1372,9 @@ static void *worker_thread(void *arg)
             if (touch_file(db, id) == 0)
                 sosend(client_fd, "OK", 2, post_request);
             else if (errno == EEXIST)
-                sosend(client_fd, "ERR already exists", 18, post_request);
+                sosend_status(client_fd, "ERR already exists", 18, post_request, 409);
             else
-                sosend(client_fd, "ERR touch failed", 16, post_request);
+                sosend_status(client_fd, "ERR touch failed", 16, post_request, 500);
         }
         else if (strcmp(cmd, "EXISTS") == 0)
         {
@@ -1201,17 +1386,17 @@ static void *worker_thread(void *arg)
         else if (strcmp(cmd, "UPDATE") == 0)
         {
             if (!data)
-                sosend(client_fd, "ERR data missing", 16, post_request);
+                sosend_status(client_fd, "ERR data missing", 16, post_request, 400);
             else if (strlen(data) > max_data_size)
             {
-                sosend(client_fd, "ERR data too large", 18, post_request);
+                sosend_status(client_fd, "ERR data too large", 18, post_request, 413);
                 audit_log("UPDATE", id, "ERROR_TOO_LARGE");
             }
             else if (write_file(db, id, data, 1) == 0)
                 sosend(client_fd, "OK", 2, post_request);
             else
             {
-                sosend(client_fd, "ERR update failed", 17, post_request);
+                sosend_status(client_fd, "ERR update failed", 17, post_request, 404);
                 audit_log("UPDATE", id, "ERROR_FAIL");
             }
         }
@@ -1221,7 +1406,7 @@ static void *worker_thread(void *arg)
                 sosend(client_fd, "OK", 2, post_request);
             else
             {
-                sosend(client_fd, "ERR delete failed", 17, post_request);
+                sosend_status(client_fd, "ERR delete failed", 17, post_request, 404);
                 audit_log("DELETE", id, "ERROR_FAIL");
             }
         }
@@ -1230,20 +1415,22 @@ static void *worker_thread(void *arg)
             char *out = malloc(max_data_size + 1);
             if (!out)
             {
-                sosend(client_fd, "ERR out of memory", 17, post_request);
+                sosend_status(client_fd, "ERR out of memory", 17, post_request, 500);
             }
             else
             {
                 if (read_file(db, id, out, max_data_size + 1) == 0)
                     sosend(client_fd, out, strlen(out), post_request);
+                else if (errno == EOVERFLOW)
+                    sosend_status(client_fd, "ERR value too large to read", 27, post_request, 500);
                 else
-                    sosend(client_fd, "ERR not found", 13, post_request);
+                    sosend_status(client_fd, "ERR not found", 13, post_request, 404);
                 free(out);
             }
         }
         else
         {
-            sosend(client_fd, "ERR unknown command", 19, post_request);
+            sosend_status(client_fd, "ERR unknown command", 19, post_request, 400);
             audit_log("UNKNOWN", cmd, "ERROR_CMD");
         }
 
@@ -1302,6 +1489,17 @@ static void load_auth_token(void)
         auth_enabled = 0;
         return;
     }
+
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof(auth_token))
+    {
+        syslog(LOG_ERR, "auth token file too large (%lld >= %zu bytes), refusing to load",
+               (long long)st.st_size, sizeof(auth_token));
+        close(fd);
+        auth_enabled = 0;
+        return;
+    }
+
     ssize_t n = read(fd, auth_token, sizeof(auth_token) - 1);
     close(fd);
     if (n <= 0)
@@ -1452,7 +1650,40 @@ int main(int argc, char *argv[])
      
     check_running();
 
-    mkdir(db_folder, 0700);
+    /* ── Startup validation: fail fast if critical paths are unusable ── */
+    if (mkdir(db_folder, 0700) == -1 && errno != EEXIST)
+    {
+        syslog(LOG_ERR, "cannot create data directory '%s': %s", db_folder, strerror(errno));
+        cleanup_socket();
+        exit(EXIT_FAILURE);
+    }
+    {
+        struct stat st;
+        if (stat(db_folder, &st) != 0 || !S_ISDIR(st.st_mode))
+        {
+            syslog(LOG_ERR, "'%s' is not a directory", db_folder);
+            cleanup_socket();
+            exit(EXIT_FAILURE);
+        }
+        if (access(db_folder, W_OK | X_OK) != 0)
+        {
+            syslog(LOG_ERR, "data directory '%s' is not writable: %s", db_folder, strerror(errno));
+            cleanup_socket();
+            exit(EXIT_FAILURE);
+        }
+        if (stat(log_folder, &st) != 0 || !S_ISDIR(st.st_mode))
+        {
+            syslog(LOG_ERR, "'%s' is not a directory", log_folder);
+            cleanup_socket();
+            exit(EXIT_FAILURE);
+        }
+        if (access(log_folder, W_OK) != 0)
+        {
+            syslog(LOG_ERR, "log directory '%s' is not writable: %s", log_folder, strerror(errno));
+            cleanup_socket();
+            exit(EXIT_FAILURE);
+        }
+    }
     unlink(socket_path);
 
     load_auth_token();

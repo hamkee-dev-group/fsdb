@@ -34,12 +34,14 @@ install: daemon fsdb.service
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 644 fsdb.service $(DESTDIR)$(UNITDIR)/fsdb.service
 	install -d $(DESTDIR)$(CONFDIR)
-	install -d $(DESTDIR)/var/lib/fsdb
-	install -d $(DESTDIR)/var/run
+	@id -u fsdb >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /var/lib/fsdb fsdb
 	@echo ""
 	@echo "Installed. To enable:"
 	@echo "  systemctl daemon-reload"
 	@echo "  systemctl enable --now fsdb"
+	@echo ""
+	@echo "Directories /run/fsdb, /var/lib/fsdb, /var/log/fsdb are"
+	@echo "managed by systemd (RuntimeDirectory, StateDirectory, LogsDirectory)."
 	@echo ""
 	@echo "Optional: create /etc/fsdb/token to enable HTTP auth"
 
