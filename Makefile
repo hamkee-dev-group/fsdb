@@ -28,6 +28,23 @@ clean:
 test: all
 	./test/test_suite.sh
 
+bench-roundtrip: all
+	@TD=$$(mktemp -d); \
+	trap 'kill $$DPID 2>/dev/null; wait $$DPID 2>/dev/null; rm -rf "$$TD"' EXIT INT TERM; \
+	export FSDB_SOCKET="$$TD/fsdb.sock"; \
+	export FSDB_DBDIR="$$TD/db"; \
+	export FSDB_LOGDIR="$$TD/log"; \
+	export FSDB_PIDFILE="$$TD/fsdb.pid"; \
+	mkdir -p "$$FSDB_DBDIR" "$$FSDB_LOGDIR"; \
+	./daemon & DPID=$$!; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		[ -S "$$FSDB_SOCKET" ] && break; \
+		kill -0 $$DPID 2>/dev/null || { echo "daemon failed to start"; exit 1; }; \
+		sleep 0.5; \
+	done; \
+	[ -S "$$FSDB_SOCKET" ] || { echo "daemon socket not ready"; exit 1; }; \
+	./test/stress
+
 install: daemon fsdb.service
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 daemon $(DESTDIR)$(BINDIR)/fsdb
@@ -50,4 +67,4 @@ uninstall:
 	rm -f $(DESTDIR)$(UNITDIR)/fsdb.service
 	@echo "Uninstalled. Run 'systemctl daemon-reload' to refresh systemd."
 
-.PHONY: all clean test install uninstall
+.PHONY: all clean test bench-roundtrip install uninstall

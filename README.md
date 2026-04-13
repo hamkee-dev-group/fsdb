@@ -66,7 +66,26 @@ kill -HUP $(cat /var/run/fsdb.pid)
 
 # Run tests
 make test
+
+# Run benchmark (self-contained, no pre-started daemon needed)
+make bench-roundtrip
+
+# Run benchmark with custom op count
+BENCH_OPS=10000 make bench-roundtrip
 ```
+
+### Benchmark
+
+`make bench-roundtrip` starts a temporary daemon, runs the stress test, prints
+machine-readable metrics, and cleans up. Output includes:
+
+- `ops_per_sec` — throughput (INSERT roundtrips per second)
+- `p50_us` / `p95_us` — per-operation latency percentiles in microseconds
+- `elapsed_s` — total wall-clock time
+
+Compare `ops_per_sec` and `p95_us` before and after a change to detect
+performance regressions. Protocol behavior and crash-safe atomic file writes
+(`temp+rename`) are verified separately by `make test`.
 
 ## Configuration (environment variables)
 
