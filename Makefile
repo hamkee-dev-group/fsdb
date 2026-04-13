@@ -26,6 +26,21 @@ clean:
 	rm -f daemon daemon.o test/client test/stress
 
 test: all
+	@if [ -n "$$FSDB_SOCKET" ]; then exec ./test/test_suite.sh; fi; \
+	TD=$$(mktemp -d); \
+	trap 'kill $$DPID 2>/dev/null; wait $$DPID 2>/dev/null; rm -rf "$$TD"' EXIT INT TERM; \
+	export FSDB_SOCKET="$$TD/fsdb.sock"; \
+	export FSDB_DBDIR="$$TD/db"; \
+	export FSDB_LOGDIR="$$TD/log"; \
+	export FSDB_PIDFILE="$$TD/fsdb.pid"; \
+	mkdir -p "$$FSDB_DBDIR" "$$FSDB_LOGDIR"; \
+	./daemon & DPID=$$!; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		[ -S "$$FSDB_SOCKET" ] && break; \
+		kill -0 $$DPID 2>/dev/null || { echo "daemon failed to start"; exit 1; }; \
+		sleep 0.5; \
+	done; \
+	[ -S "$$FSDB_SOCKET" ] || { echo "daemon socket not ready"; exit 1; }; \
 	./test/test_suite.sh
 
 install: daemon fsdb.service
