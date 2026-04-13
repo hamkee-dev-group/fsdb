@@ -111,6 +111,89 @@ static int test_update_update(void)
 }
 
 /*
+ * Contract: concurrent GET during UPDATE must return either the
+ * complete old value or the complete new value — never empty,
+ * truncated, or mixed data.  The temp+rename write path should
+ * guarantee this atomicity.
+ */
+
+#define VLEN 200
+#define NREADERS 4
+
+struct ar_reader {
+    char cmd[256];
+    char resp[VLEN + 64];
+    int bad;         /* set by thread if response is invalid */
+};
+
+static char val_a[VLEN + 1];
+static char val_b[VLEN + 1];
+
+static void *ar_read_racer(void *arg)
+{
+    struct ar_reader *r = arg;
+    pthread_barrier_wait(&bar);
+    send_cmd(r->cmd, r->resp, sizeof(r->resp));
+    /* Validate: must be all-A or all-B, exact length */
+    r->bad = (strcmp(r->resp, val_a) != 0 && strcmp(r->resp, val_b) != 0);
+    return NULL;
+}
+
+static int test_atomic_read(void)
+{
+    char cmd[VLEN + 64], resp[VLEN + 64];
+    int fail = 0;
+
+    memset(val_a, 'A', VLEN); val_a[VLEN] = '\0';
+    memset(val_b, 'B', VLEN); val_b[VLEN] = '\0';
+
+    printf("[CONC] UPDATE+GET atomic read\n");
+    for (int i = 0; i < ITERS; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "ar%d", i);
+
+        snprintf(cmd, sizeof(cmd), "INSERT %s %s %s", db, key, val_a);
+        send_cmd(cmd, resp, sizeof(resp));
+
+        pthread_barrier_init(&bar, NULL, NREADERS + 1);
+        struct targ updater = {{0}};
+        snprintf(updater.cmd, sizeof(updater.cmd),
+                 "UPDATE %s %s %s", db, key, val_b);
+
+        struct ar_reader readers[NREADERS];
+        for (int r = 0; r < NREADERS; r++) {
+            memset(&readers[r], 0, sizeof(readers[r]));
+            snprintf(readers[r].cmd, sizeof(readers[r].cmd),
+                     "GET %s %s", db, key);
+        }
+
+        pthread_t tu, tr[NREADERS];
+        pthread_create(&tu, NULL, racer, &updater);
+        for (int r = 0; r < NREADERS; r++)
+            pthread_create(&tr[r], NULL, ar_read_racer, &readers[r]);
+        pthread_join(tu, NULL);
+        for (int r = 0; r < NREADERS; r++)
+            pthread_join(tr[r], NULL);
+        pthread_barrier_destroy(&bar);
+
+        for (int r = 0; r < NREADERS; r++) {
+            if (readers[r].bad) {
+                printf("  FAIL iter %d reader %d: got len=%zu '%.*s...'\n",
+                       i, r, strlen(readers[r].resp), 20, readers[r].resp);
+                fail++;
+            }
+        }
+
+        snprintf(cmd, sizeof(cmd), "DELETE %s %s", db, key);
+        send_cmd(cmd, resp, sizeof(resp));
+    }
+    if (!fail)
+        printf("  PASS: %d iterations — readers see only complete values\n",
+               ITERS);
+    return fail;
+}
+
+/*
  * Contract: concurrent UPDATE + DELETE on the same key must not
  * resurrect stale data.  After both complete, GET must return either
  * the updated value or "not found" — never the original value.
@@ -170,6 +253,7 @@ int main(void)
     int fail = 0;
     fail += test_update_update();
     fail += test_update_delete();
+    fail += test_atomic_read();
 
     if (fail) {
         printf("FAILED: %d contract violations\n", fail);
