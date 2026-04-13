@@ -8,7 +8,7 @@ BINDIR  := $(PREFIX)/bin
 UNITDIR := /etc/systemd/system
 CONFDIR := /etc/fsdb
 
-all: daemon test/client test/stress
+all: daemon test/client test/stress test/conc
 
 daemon: daemon.o
 	$(CC) daemon.o $(LDFLAGS) -o $@
@@ -22,8 +22,11 @@ test/client: test/client.c
 test/stress: test/stress.c
 	$(CC) $(CFLAGS) test/stress.c -o test/stress $(LDFLAGS)
 
+test/conc: test/conc.c
+	$(CC) $(CFLAGS) test/conc.c -o test/conc $(LDFLAGS)
+
 clean:
-	rm -f daemon daemon.o test/client test/stress
+	rm -f daemon daemon.o test/client test/stress test/conc
 
 test: all
 	./test/test_suite.sh
