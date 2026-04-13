@@ -248,8 +248,10 @@ static int check_http_auth(const char *buf)
 {
     if (!auth_enabled)
         return 1;
+    /* Only search headers, not the POST body, to prevent auth smuggling */
+    const char *hdr_end = strstr(buf, "\r\n\r\n");
     const char *auth = strcasestr(buf, "\r\nAuthorization:");
-    if (!auth)
+    if (!auth || (hdr_end && auth >= hdr_end))
         return 0;
     auth += 16;
     while (*auth == ' ')
