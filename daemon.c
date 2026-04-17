@@ -749,6 +749,12 @@ static int delete_file(const char *db, const char *id)
     char path[MAX_PATH_LEN];
     if (build_data_path(path, sizeof(path), db, id) != 0)
         return -1;
+    if (is_expired(path))
+    {
+        unlink(path);
+        errno = ENOENT;
+        return -1;
+    }
     if (unlink(path) != 0)
         return -1;
     fsync_parent_dir(path);

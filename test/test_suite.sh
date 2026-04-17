@@ -480,6 +480,58 @@ else
     ((FAIL++)) || true
 fi
 
+# ── Regression: DELETE must treat TTL-expired keys as not found ──
+echo "[REGRESSION: DELETE honors TTL expiry]"
+_TTL_TMPDIR=$(mktemp -d)
+(
+    export FSDB_SOCKET="$_TTL_TMPDIR/fsdb.sock"
+    export FSDB_DBDIR="$_TTL_TMPDIR/db"
+    export FSDB_LOGDIR="$_TTL_TMPDIR/log"
+    export FSDB_PIDFILE="$_TTL_TMPDIR/fsdb.pid"
+    export FSDB_TTL=1
+    mkdir -p "$FSDB_DBDIR" "$FSDB_LOGDIR"
+    ./daemon &
+    _TTL_PID=$!
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -S "$FSDB_SOCKET" ] && break
+        kill -0 $_TTL_PID 2>/dev/null || { echo "  ttl daemon failed to start"; exit 1; }
+        sleep 0.5
+    done
+    if [ -S "$FSDB_SOCKET" ]; then
+        TTL_DB="ttl$$"
+        $CLIENT "CREATE $TTL_DB" >/dev/null 2>&1 || true
+        $CLIENT "INSERT $TTL_DB x value" >/dev/null 2>&1 || true
+        sleep 2
+        del_resp=$($CLIENT "DELETE $TTL_DB x" 2>/dev/null || true)
+        cnt_resp=$($CLIENT "COUNT $TTL_DB" 2>/dev/null || true)
+        if [ "$del_resp" = "ERR delete failed" ]; then
+            echo "  PASS: DELETE on TTL-expired key returns ERR delete failed"
+        else
+            echo "  FAIL: DELETE on TTL-expired key — expected 'ERR delete failed', got: $del_resp"
+            exit 1
+        fi
+        if [ "$cnt_resp" = "0" ]; then
+            echo "  PASS: COUNT after TTL expiry returns 0"
+        else
+            echo "  FAIL: COUNT after TTL expiry — expected '0', got: $cnt_resp"
+            exit 1
+        fi
+    else
+        echo "  FAIL: ttl daemon socket not ready"
+        kill "$_TTL_PID" 2>/dev/null || true
+        exit 1
+    fi
+    kill "$_TTL_PID" 2>/dev/null || true
+    wait "$_TTL_PID" 2>/dev/null || true
+)
+_ttl_rc=$?
+rm -rf "$_TTL_TMPDIR"
+if [ "$_ttl_rc" -eq 0 ]; then
+    ((PASS += 2)) || true
+else
+    ((FAIL++)) || true
+fi
+
 # ── Results ──
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
