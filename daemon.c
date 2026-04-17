@@ -839,15 +839,15 @@ static void handle_keys(int fd, const char *db, int limit, int post_request)
                     continue;
                 if (strchr(es->d_name, '.'))
                     continue; /* temp-file artifact (e.g. a.XXXXXX from crash) */
-                if (default_ttl > 0)
+                char fp[MAX_PATH_LEN];
+                snprintf(fp, sizeof(fp), "%s/%s", l1, es->d_name);
+                struct stat est;
+                if (lstat(fp, &est) != 0 || !S_ISREG(est.st_mode))
+                    continue; /* skip stray subdirs / non-files */
+                if (default_ttl > 0 && is_expired(fp))
                 {
-                    char fp[MAX_PATH_LEN];
-                    snprintf(fp, sizeof(fp), "%s/%s", l1, es->d_name);
-                    if (is_expired(fp))
-                    {
-                        unlink(fp);
-                        continue;
-                    }
+                    unlink(fp);
+                    continue;
                 }
                 int n = snprintf(out + pos, MAX_KEYS_BUF - pos, "%s\n", es->d_name);
                 if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF - KEYS_TRUNCATED_RESERVE)
@@ -882,16 +882,16 @@ static void handle_keys(int fd, const char *db, int limit, int post_request)
                     if (e3->d_name[0] == '.')
                         continue;
                     if (strchr(e3->d_name, '.'))
-                        continue;  
-                    if (default_ttl > 0)
+                        continue;
+                    char fp[MAX_PATH_LEN];
+                    snprintf(fp, sizeof(fp), "%s/%s", l2, e3->d_name);
+                    struct stat est;
+                    if (lstat(fp, &est) != 0 || !S_ISREG(est.st_mode))
+                        continue; /* skip stray subdirs / non-files */
+                    if (default_ttl > 0 && is_expired(fp))
                     {
-                        char fp[MAX_PATH_LEN];
-                        snprintf(fp, sizeof(fp), "%s/%s", l2, e3->d_name);
-                        if (is_expired(fp))
-                        {
-                            unlink(fp);
-                            continue;
-                        }
+                        unlink(fp);
+                        continue;
                     }
                     int n = snprintf(out + pos, MAX_KEYS_BUF - pos, "%s\n", e3->d_name);
                     if (n < 0 || pos + (size_t)n >= MAX_KEYS_BUF - KEYS_TRUNCATED_RESERVE)
@@ -965,15 +965,15 @@ static void handle_count(int fd, const char *db, int post_request)
                     continue;
                 if (strchr(es->d_name, '.'))
                     continue; /* temp-file artifact */
-                if (default_ttl > 0)
+                char fp[MAX_PATH_LEN];
+                snprintf(fp, sizeof(fp), "%s/%s", l1, es->d_name);
+                struct stat est;
+                if (lstat(fp, &est) != 0 || !S_ISREG(est.st_mode))
+                    continue; /* skip stray subdirs / non-files */
+                if (default_ttl > 0 && is_expired(fp))
                 {
-                    char fp[MAX_PATH_LEN];
-                    snprintf(fp, sizeof(fp), "%s/%s", l1, es->d_name);
-                    if (is_expired(fp))
-                    {
-                        unlink(fp);
-                        continue;
-                    }
+                    unlink(fp);
+                    continue;
                 }
                 count++;
             }
@@ -999,15 +999,15 @@ static void handle_count(int fd, const char *db, int post_request)
                 {
                     if (e3->d_name[0] == '.' || strchr(e3->d_name, '.'))
                         continue;
-                    if (default_ttl > 0)
+                    char fp[MAX_PATH_LEN];
+                    snprintf(fp, sizeof(fp), "%s/%s", l2, e3->d_name);
+                    struct stat est;
+                    if (lstat(fp, &est) != 0 || !S_ISREG(est.st_mode))
+                        continue; /* skip stray subdirs / non-files */
+                    if (default_ttl > 0 && is_expired(fp))
                     {
-                        char fp[MAX_PATH_LEN];
-                        snprintf(fp, sizeof(fp), "%s/%s", l2, e3->d_name);
-                        if (is_expired(fp))
-                        {
-                            unlink(fp);
-                            continue;
-                        }
+                        unlink(fp);
+                        continue;
                     }
                     count++;
                 }

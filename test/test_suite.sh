@@ -126,6 +126,16 @@ $CLIENT "DELETE $DB ka" >/dev/null 2>&1 || true
 $CLIENT "DELETE $DB kb" >/dev/null 2>&1 || true
 $CLIENT "DELETE $DB kc" >/dev/null 2>&1 || true
 
+# ── KEYS / COUNT must skip stray subdirs (non-file shard entries) ──
+echo "[KEYS/COUNT: stray subdirs ignored]"
+DIRBUG_DB="dirbug$$"
+$CLIENT "CREATE $DIRBUG_DB" >/dev/null 2>&1 || true
+mkdir -p "$FSDB_DBDIR/$DIRBUG_DB/_/z"
+mkdir -p "$FSDB_DBDIR/$DIRBUG_DB/a/b/fakekey"
+run_test "KEYS skips stray subdirs"   "KEYS $DIRBUG_DB"   "EMPTY"
+run_test "COUNT skips stray subdirs"  "COUNT $DIRBUG_DB"  "0"
+rm -rf "$FSDB_DBDIR/$DIRBUG_DB"
+
 # ── Error handling ──
 echo "[ERRORS]"
 run_test "invalid db name"   "GET ../etc key1"       "ERR invalid DB"
