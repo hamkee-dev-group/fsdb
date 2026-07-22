@@ -136,6 +136,32 @@ run_test "KEYS skips stray subdirs"   "KEYS $DIRBUG_DB"   "EMPTY"
 run_test "COUNT skips stray subdirs"  "COUNT $DIRBUG_DB"  "0"
 rm -rf "$FSDB_DBDIR/$DIRBUG_DB"
 
+# ── KEYS / COUNT with mixed single-char and multi-char IDs ──
+echo "[KEYS/COUNT: mixed single/multi-char IDs]"
+MIXID_DB="mixid$$"
+run_test "insert single-char a"  "INSERT $MIXID_DB a val1"   "OK"
+run_test "insert single-char x"  "INSERT $MIXID_DB x val2"   "OK"
+run_test "insert multi-char ab"  "INSERT $MIXID_DB ab val3"  "OK"
+run_test "insert multi-char xy"  "INSERT $MIXID_DB xy val4"  "OK"
+mix_keys=$($CLIENT "KEYS $MIXID_DB" 2>/dev/null || true)
+for _k in a x ab xy; do
+    if echo "$mix_keys" | grep -qx "$_k"; then
+        echo "  PASS: KEYS lists '$_k'"
+        ((PASS++)) || true
+    else
+        echo "  FAIL: KEYS missing '$_k'"
+        echo "        got: $mix_keys"
+        ((FAIL++)) || true
+    fi
+done
+run_test "count mixed keys"      "COUNT $MIXID_DB"           "4"
+$CLIENT "DELETE $MIXID_DB a"  >/dev/null 2>&1 || true
+$CLIENT "DELETE $MIXID_DB x"  >/dev/null 2>&1 || true
+$CLIENT "DELETE $MIXID_DB ab" >/dev/null 2>&1 || true
+$CLIENT "DELETE $MIXID_DB xy" >/dev/null 2>&1 || true
+run_test "count after delete all" "COUNT $MIXID_DB"          "0"
+rm -rf "$FSDB_DBDIR/$MIXID_DB"
+
 # ── Error handling ──
 echo "[ERRORS]"
 run_test "invalid db name"   "GET ../etc key1"       "ERR invalid DB"
